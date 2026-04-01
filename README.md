@@ -1,4 +1,48 @@
-# tlsf
+# tlsf on STM32H5/7
+
+This repo integrates the TLSF with wrappers to replace the default STM32H5/7 heap allocator. A TLSF pool is created from the free RAM between the end of BSS and the reserved stack region, and the standard `malloc`/`free`/etc. functions are wrapped to call into TLSF. The integration also includes debug features like red-zone canaries, use-after-free poisoning, and an allocation tracking table to help detect heap corruption.
+
+To build with tlsf, the wrappers:
+```
+-Wl,--wrap=malloc,--wrap=free,--wrap=calloc,--wrap=realloc
+   -Wl,--wrap=_malloc_r,--wrap=_free_r,--wrap=_calloc_r,--wrap=_realloc_r
+```
+are added to the linker flags, and the TLSF library is included as a dependency. In platformio, these flags are set in `platformio.ini` under `build_flags` for the relevant environment, and the library is added placed in a folder in the lib directory.
+
+Example linker script region for the TLSF pool:
+```ld
+/* Highest address of the user mode stack */
+_estack = ORIGIN(RAM) + LENGTH(RAM); /* end of "RAM" Ram type memory */
+
+_Min_Stack_Size = 0x10000; /* 64 KB stack */
+
+... all standard sections like .text, .data, .bss, etc. are defined here, through bss region ...
+
+  __bss_end__ = _ebss;
+  } >RAM
+
+  /* TLSF heap pool: all free RAM between end-of-BSS and the stack region */
+  ._user_heap_stack :
+  {
+    . = ALIGN(8);
+    PROVIDE ( end = . );
+    PROVIDE ( _end = . );
+    _heap_start = .;
+    . = ABSOLUTE(_estack - _Min_Stack_Size);
+    _heap_end = .;
+  } >RAM
+
+  /* Remove information from the compiler libraries */
+
+  ... discard and arm atributes sections ...
+
+  ```
+Note min_stack_size is misleadingly named since that is the maximum reserved memory for the stack, and overrunning will cause heap corruption. The TLSF pool is the free RAM between `_heap_start` and `_heap_end`, which are computed from the linker script symbols.
+
+The rest of this README is unmodified from the original TLSF README, which is included below for reference.
+
+---
+
 Two-Level Segregated Fit memory allocator implementation.
 Written by Matthew Conte (matt@baisoku.org).
 Released under the BSD license.
