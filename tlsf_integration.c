@@ -16,11 +16,37 @@
 #include "tlsf.h"
 
 /* ================================================================== */
-/*  Debug red-zone & allocation tracking                               */
-/*  Set TLSF_REDZONE to 0 in production to disable overhead.          */
+/*  Debug and feature flags for TLSF integration                       */
+/*  Disable in production via -D flags to save RAM/CPU.               */
 /* ================================================================== */
 #ifndef TLSF_REDZONE
-#define TLSF_REDZONE 1 /* 1 = enable red-zone canaries       */
+#define TLSF_REDZONE 1 /* 1 = enable red-zone canaries (default) */
+#endif
+
+/* Fine-grained controls (defaults chosen to preserve existing behavior)
+ * - TLSF_POISON_FREE: overwrite freed memory with 0xCD and enable
+ *   double-free detection (defaults to TLSF_REDZONE).
+ * - TLSF_HISTORY: keep a small ring buffer of recent alloc/free ops
+ *   for post-mortem debugging (defaults to TLSF_REDZONE).
+ * - TLSF_PEAK_TRACK: maintain `s_current_heap_used`/`s_peak_heap_used`
+ *   (small runtime cost; enabled by default).
+ * - TLSF_ISR_SAFE: mask the USB IRQ around allocator ops (disabled by
+ *   default; enable only if needed).
+ */
+#ifndef TLSF_POISON_FREE
+#define TLSF_POISON_FREE TLSF_REDZONE
+#endif
+
+#ifndef TLSF_HISTORY
+#define TLSF_HISTORY TLSF_REDZONE
+#endif
+
+#ifndef TLSF_PEAK_TRACK
+#define TLSF_PEAK_TRACK 1
+#endif
+
+#ifndef TLSF_ISR_SAFE
+#define TLSF_ISR_SAFE 0
 #endif
 
 #if TLSF_REDZONE
@@ -114,8 +140,9 @@ static void redzone_handler(void) {
 }
 
 /* ================================================================== */
-/*  Double-free detection                                              */
+/*  Double-free detection (optional)                                   */
 /* ================================================================== */
+#if TLSF_POISON_FREE
 typedef struct {
     void* ptr;         /* pointer being double-freed           */
     void* free_caller; /* who called the second free           */
@@ -128,10 +155,13 @@ static void double_free_handler(void) {
     while (hang) { /* set hang=0 in debugger, inspect df_info */
     }
 }
+#endif
 
 /* ================================================================== */
 /*  Allocation history ring buffer (last 256 operations)               */
+/*  Can be disabled to save RAM/CPU by setting TLSF_HISTORY=0.        */
 /* ================================================================== */
+#if TLSF_HISTORY
 #define HISTORY_BITS 8
 #define HISTORY_SIZE (1u << HISTORY_BITS)
 #define HISTORY_MASK (HISTORY_SIZE - 1)
@@ -153,6 +183,14 @@ static void history_record(uint8_t op, void* ptr, uint32_t size, void* caller) {
     s_history[idx].size = size;
     s_history[idx].caller = caller;
 }
+#else
+static inline void history_record(uint8_t op, void* ptr, uint32_t size, void* caller) {
+    (void)op;
+    (void)ptr;
+    (void)size;
+    (void)caller;
+}
+#endif
 
 static void write_canary(void* ptr, uint32_t user_size) {
     memset((uint8_t*)ptr + user_size, REDZONE_FILL, REDZONE_SIZE);
@@ -198,11 +236,15 @@ static int check_canary(void* ptr, const alloc_entry_t* entry, void* free_caller
 static inline void alloc_enter(uint8_t op, void* caller) {
     (void)op;
     (void)caller;
-    // HAL_NVIC_DisableIRQ(USB_IRQn);
+#if TLSF_ISR_SAFE
+    HAL_NVIC_DisableIRQ(USB_IRQn);
+#endif
 }
 
 static inline void alloc_exit(void) {
-    // HAL_NVIC_EnableIRQ(USB_IRQn);
+#if TLSF_ISR_SAFE
+    HAL_NVIC_EnableIRQ(USB_IRQn);
+#endif
 }
 
 /* Linker-provided symbols */
@@ -214,8 +256,10 @@ static tlsf_t s_tlsf = NULL;
 static volatile int s_tlsf_initializing = 0;
 
 /* Peak heap-usage tracking (updated in malloc/free/realloc wrappers) */
+#if TLSF_PEAK_TRACK
 static size_t s_current_heap_used = 0;
 static size_t s_peak_heap_used = 0;
+#endif
 
 /**
  * @brief Ensure the TLSF pool is initialized. Safe to call multiple times.
@@ -285,7 +329,14 @@ void tlsf_get_status(size_t* total, size_t* used, size_t* free_bytes, int* integ
 /**
  * @brief Return peak heap usage observed since boot.
  */
+#if TLSF_PEAK_TRACK
 void tlsf_get_peak(size_t* peak_heap_used) { *peak_heap_used = s_peak_heap_used; }
+#else
+void tlsf_get_peak(size_t* peak_heap_used) {
+    (void)peak_heap_used;
+    *peak_heap_used = 0;
+}
+#endif
 
 /* ------------------------------------------------------------------ */
 /*  --wrap interceptors for standard C allocation functions            */
@@ -299,19 +350,25 @@ void* __wrap_malloc(size_t size) {
     /* Over-allocate to make room for canary sentinel after user data */
     void* ptr = tlsf_malloc(s_tlsf, size + REDZONE_SIZE);
     if (ptr) {
+#if TLSF_PEAK_TRACK
         s_current_heap_used += tlsf_block_size(ptr);
         if (s_current_heap_used > s_peak_heap_used) s_peak_heap_used = s_current_heap_used;
+#endif
         write_canary(ptr, (uint32_t)size);
         alloc_table_insert(ptr, (uint32_t)size, caller);
+#if TLSF_HISTORY
         history_record('M', ptr, (uint32_t)size, caller);
+#endif
     }
     alloc_exit();
     return ptr;
 #else
     void* ptr = tlsf_malloc(s_tlsf, size);
     if (ptr) {
+#if TLSF_PEAK_TRACK
         s_current_heap_used += tlsf_block_size(ptr);
         if (s_current_heap_used > s_peak_heap_used) s_peak_heap_used = s_current_heap_used;
+#endif
     }
     alloc_exit();
     return ptr;
@@ -327,20 +384,28 @@ void __wrap_free(void* ptr) {
     alloc_entry_t* entry = alloc_table_find(ptr);
     if (entry) {
         check_canary(ptr, entry, caller);
+#if TLSF_POISON_FREE
         /* Poison user data to detect use-after-free */
         memset(ptr, FREE_FILL, entry->requested_size + REDZONE_SIZE);
+#endif
         alloc_table_remove(ptr);
     } else {
+#if TLSF_POISON_FREE
         /* Not in table — check for double-free (already poisoned with 0xCD) */
         if (*(volatile uint32_t*)ptr == 0xCDCDCDCDu) {
             df_info.ptr = ptr;
             df_info.free_caller = caller;
             double_free_handler(); /* spins — inspect df_info in debugger */
         }
+#endif
     }
+#if TLSF_HISTORY
     history_record('F', ptr, 0, caller);
 #endif
+#endif
+#if TLSF_PEAK_TRACK
     s_current_heap_used -= tlsf_block_size(ptr);
+#endif
     tlsf_free(s_tlsf, ptr);
     alloc_exit();
 }
@@ -372,13 +437,19 @@ void* __wrap_realloc(void* ptr, size_t size) {
     void* new_ptr = tlsf_realloc(s_tlsf, ptr, size + REDZONE_SIZE);
     if (new_ptr) {
         size_t new_size = tlsf_block_size(new_ptr);
+#if TLSF_PEAK_TRACK
         s_current_heap_used = s_current_heap_used - old_size + new_size;
         if (s_current_heap_used > s_peak_heap_used) s_peak_heap_used = s_current_heap_used;
+#endif
         write_canary(new_ptr, (uint32_t)size);
         alloc_table_insert(new_ptr, (uint32_t)size, caller);
+#if TLSF_HISTORY
         history_record('R', new_ptr, (uint32_t)size, caller);
+#endif
     } else if (size == 0 && ptr) {
+#if TLSF_PEAK_TRACK
         s_current_heap_used -= old_size;
+#endif
     }
     alloc_exit();
     return new_ptr;
@@ -387,11 +458,15 @@ void* __wrap_realloc(void* ptr, size_t size) {
     void* new_ptr = tlsf_realloc(s_tlsf, ptr, size);
     if (new_ptr) {
         size_t new_size = tlsf_block_size(new_ptr);
+#if TLSF_PEAK_TRACK
         s_current_heap_used = s_current_heap_used - old_size + new_size;
         if (s_current_heap_used > s_peak_heap_used) s_peak_heap_used = s_current_heap_used;
+#endif
     } else if (size == 0 && ptr) {
         /* realloc(ptr, 0) acts as free in some implementations */
+#if TLSF_PEAK_TRACK
         s_current_heap_used -= old_size;
+#endif
     }
     alloc_exit();
     return new_ptr;
